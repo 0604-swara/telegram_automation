@@ -1,6 +1,13 @@
 .env
+.env.test
+.env.*
+!.env.example
+!.env.test.example
 *.db
+*.db-wal
+*.db-shm
 *.log
+*.lock
 __pycache__/
 venv/
 .venv/

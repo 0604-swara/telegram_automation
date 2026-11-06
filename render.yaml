@@ -1,0 +1,48 @@
+services:
+  - type: worker
+    name: telegram-content-automation
+    runtime: python
+    plan: starter
+    numInstances: 1
+    autoDeploy: false
+    buildCommand: pip install -r requirements.txt
+    startCommand: python process_manager.py
+    disk:
+      name: telegram-automation-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.18
+      - key: PERSISTENT_DISK_PATH
+        value: /var/data
+      - key: DB_PATH
+        value: /var/data/telegram_queue.db
+      - key: TELEGRAM_TEST_MODE
+        value: "0"
+      - key: PUBLISH_INTERVAL_SECONDS
+        value: "300"
+      - key: EMPTY_QUEUE_CHECK_SECONDS
+        value: "30"
+      - key: ALBUM_WAIT_SECONDS
+        value: "15"
+      - key: SCHEDULER_LOCK_FILE
+        value: /var/data/scheduler.lock
+      - key: LISTENER_LOCK_FILE
+        value: /var/data/listener.lock
+      - key: PROCESS_MANAGER_LOCK_FILE
+        value: /var/data/process_manager.lock
+      - key: LOG_TO_STDOUT
+        value: "1"
+      - key: BACKUP_DIR
+        value: /var/data/backups
+      - key: BACKUP_RETENTION_DAYS
+        value: "30"
+      - key: STALE_CLAIM_SECONDS
+        value: "900"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: SOURCE_CHANNEL_ID
+        sync: false
+      - key: DESTINATION_CHANNEL_ID
+        sync: false
