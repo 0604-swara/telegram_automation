@@ -516,6 +516,17 @@ class DeploymentPreparationTests(unittest.TestCase):
                     )
 
                 invalid_settings = dict(settings)
+                invalid_settings["PUBLISH_END_TIME"] = "08:00"
+                with self.assertRaisesRegex(
+                    config.ConfigurationError,
+                    "PUBLISH_START_TIME and PUBLISH_END_TIME",
+                ):
+                    process_manager.validate_render_settings(
+                        invalid_settings,
+                        disk_path=mount,
+                    )
+
+                invalid_settings = dict(settings)
                 invalid_settings["DB_PATH"] = str(
                     mount / "telegram_test.db"
                 )
@@ -699,6 +710,10 @@ class DeploymentPreparationTests(unittest.TestCase):
         self.assertIn("mountPath: /var/data", blueprint)
         self.assertIn("DB_PATH", blueprint)
         self.assertIn("python process_manager.py", blueprint)
+        self.assertIn("PUBLISH_START_TIME", blueprint)
+        self.assertIn('value: "08:00"', blueprint)
+        self.assertIn("PUBLISH_END_TIME", blueprint)
+        self.assertIn('value: "12:00"', blueprint)
         self.assertIn("sync: false", blueprint)
 
     def test_render_preflight_rejects_missing_credentials_and_channel_ids(self):

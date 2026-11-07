@@ -26,7 +26,12 @@ Edit `.env` with the real bot token and channel IDs. Never commit `.env`.
 | `DESTINATION_CHANNEL_ID` | scheduler | Numeric chat id |
 | `DB_PATH` | all | Default `telegram_queue.db`; resolved to an absolute path |
 
-Optional: `PUBLISH_INTERVAL_SECONDS` (default 300), `STALE_CLAIM_SECONDS` (900), `SCHEDULER_LOCK_FILE`, `LISTENER_LOCK_FILE`. `LOG_TO_STDOUT=1` sends application logger messages to stdout (for journald); the default remains rotating local files.
+Optional: `PUBLISH_INTERVAL_SECONDS` (default 300), `PUBLISH_START_TIME`
+(default `08:00`), `PUBLISH_END_TIME` (default `12:00`),
+`STALE_CLAIM_SECONDS` (900), `SCHEDULER_LOCK_FILE`, and
+`LISTENER_LOCK_FILE`. Times use 24-hour `HH:MM` in Asia/Kolkata. `LOG_TO_STDOUT=1`
+sends application logger messages to stdout (for journald); the default
+remains rotating local files.
 
 ## New posts and publishing schedule
 
@@ -59,9 +64,15 @@ queue. This manual decision can intentionally exclude posts through the
 chosen boundary. Telegram and SQLite cannot share a transaction, so exactly
 once processing or strict no-loss guarantees are not claimed.
 
-The scheduler checks an initial slot at startup and then attempts at most one
-publish unit every five minutes. Empty slots are skipped; new arrivals wait
-for the next slot and take priority according to newest-first ordering.
+Publishing is restricted to 08:00 through 11:55 IST, on five-minute slots;
+12:00 is excluded. The first daily slot is 08:00. Restarts outside the
+window leave the scheduler idle until the next day's 08:00 slot, while the
+listener continues saving incoming posts. Posts remain pending outside
+publishing hours and are not cleared or cycle-reset when the window closes.
+Each slot attempts at most one publish unit. Missed slots are skipped rather
+than replayed, and the next eligible slot resumes the existing newest-first
+priority and album grouping. A confirmed-safe retry is not sent after the
+window closes; its claim is released back to pending without consuming a retry.
 
 ## Start
 

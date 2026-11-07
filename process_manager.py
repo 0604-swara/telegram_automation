@@ -19,7 +19,11 @@ from config import (
     validate_config,
 )
 from database import DB_NAME, DatabaseError, initialize_database
-from scheduler import SchedulerError, SingleInstanceLock
+from scheduler import (
+    SchedulerError,
+    SingleInstanceLock,
+    validate_publish_schedule,
+)
 from telegram_handler import (
     GoLiveBootstrapError,
     bootstrap_go_live_boundary,
@@ -122,6 +126,11 @@ def validate_render_settings(env=None, disk_path=None):
         raise ConfigurationError(
             "Render production requires PUBLISH_INTERVAL_SECONDS=300."
         )
+    validate_publish_schedule(
+        settings.get("PUBLISH_START_TIME", "08:00"),
+        settings.get("PUBLISH_END_TIME", "12:00"),
+        int(interval),
+    )
 
     for name in ("SCHEDULER_LOCK_FILE", "LISTENER_LOCK_FILE",
                  "PROCESS_MANAGER_LOCK_FILE"):

@@ -65,6 +65,8 @@ in the dashboard; do not write real values into YAML or Git.
 | `PERSISTENT_DISK_PATH` | `/var/data` |
 | `DB_PATH` | `/var/data/telegram_queue.db` |
 | `PUBLISH_INTERVAL_SECONDS` | `300`; launcher rejects other values |
+| `PUBLISH_START_TIME` | `08:00` Asia/Kolkata; first daily slot |
+| `PUBLISH_END_TIME` | `12:00` Asia/Kolkata; exclusive end |
 | `EMPTY_QUEUE_CHECK_SECONDS` | `30` (maximum sleep chunk while waiting for the next fixed slot) |
 | `ALBUM_WAIT_SECONDS` | `15` (current default; album grouping wait) |
 | `SCHEDULER_LOCK_FILE` | `/var/data/scheduler.lock` |
@@ -100,12 +102,15 @@ that boundary are excluded. Updates with higher IDs, including posts whose
 message timestamp matches the initialization second, remain eligible. No
 backfill is planned.
 
-The scheduler checks its first slot at startup and then runs at most one
-publishing attempt per configured 300-second slot. If a slot has no eligible
-post, later arrivals wait for the next slot. At each slot the newest eligible
-single post or complete album is selected first; a newly received post
-therefore takes priority at the next slot. The next eligible queue cycle
-continues after all eligible posts have been published.
+The scheduler publishes only from 08:00 through 11:55 IST at 300-second
+intervals; 12:00 is excluded. It starts at the next valid slot rather than
+publishing immediately on a restart. Outside the window, the scheduler waits
+while the listener continues receiving and storing posts. Pending posts are
+preserved until the next window. Missed slots are skipped without catch-up
+publishes. At each slot, the newest eligible single post or complete album
+is selected; queue order and cycle restart behavior remain unchanged.
+Confirmed-safe retries are not sent after closing time and return to pending
+without consuming a retry.
 
 Do not upload `telegram_test.db`, local development DBs, or test backups to
 the Render disk. Before starting the worker, the operator must confirm the

@@ -26,7 +26,9 @@ import time
 import traceback
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, time as datetime_time, timedelta
 from logging.handlers import RotatingFileHandler
+from zoneinfo import ZoneInfo
 
 import requests
 from dotenv import load_dotenv
@@ -91,6 +93,48 @@ STALE_CLAIM_SECONDS = int(os.getenv("STALE_CLAIM_SECONDS", "900"))
 TRANSIENT_ATTEMPTS = int(os.getenv("PUBLISH_TRANSIENT_ATTEMPTS", "3"))
 HTTP_TIMEOUT_SECONDS = int(os.getenv("PUBLISH_HTTP_TIMEOUT_SECONDS", "30"))
 LOCK_FILE = os.getenv("SCHEDULER_LOCK_FILE", "scheduler.lock")
+PUBLISH_TIMEZONE = ZoneInfo("Asia/Kolkata")
+SLOT_START_GRACE_SECONDS = 5
+
+
+def _parse_publish_time(value, name):
+    try:
+        parsed = datetime.strptime(value, "%H:%M").time()
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError(
+            f"{name} must use 24-hour HH:MM format."
+        ) from exc
+    if parsed.strftime("%H:%M") != value:
+        raise ConfigurationError(
+            f"{name} must use zero-padded 24-hour HH:MM format."
+        )
+    return parsed
+
+
+def validate_publish_schedule(start_value, end_value, interval):
+    """Validate the configured daily local-time publishing schedule."""
+    start = _parse_publish_time(start_value, "PUBLISH_START_TIME")
+    end = _parse_publish_time(end_value, "PUBLISH_END_TIME")
+    if start >= end:
+        raise ConfigurationError(
+            "PUBLISH_START_TIME and PUBLISH_END_TIME must define a window "
+            "with start earlier than end."
+        )
+    if interval < 1:
+        raise ConfigurationError("PUBLISH_INTERVAL_SECONDS must be positive.")
+    return start, end
+
+
+try:
+    PUBLISH_START_TIME, PUBLISH_END_TIME = validate_publish_schedule(
+        os.getenv("PUBLISH_START_TIME", "08:00"),
+        os.getenv("PUBLISH_END_TIME", "12:00"),
+        INTERVAL,
+    )
+except ConfigurationError as exc:
+    _CONFIGURATION_ERRORS.append(str(exc))
+    PUBLISH_START_TIME = datetime_time(8, 0)
+    PUBLISH_END_TIME = datetime_time(12, 0)
 
 _logger = logging.getLogger("scheduler")
 _shutdown_requested = False
@@ -237,6 +281,61 @@ def _sleep_interruptible(seconds):
                 )
             last_heartbeat = now
         time.sleep(max(0.0, min(1.0, deadline - time.monotonic())))
+
+
+def _now_ist():
+    return datetime.now(PUBLISH_TIMEZONE)
+
+
+def _next_publish_slot(now):
+    """Return the next interval-aligned slot, inclusive, in Asia/Kolkata."""
+    local_now = now.astimezone(PUBLISH_TIMEZONE)
+    start = datetime.combine(
+        local_now.date(),
+        PUBLISH_START_TIME,
+        tzinfo=PUBLISH_TIMEZONE,
+    )
+    end = datetime.combine(
+        local_now.date(),
+        PUBLISH_END_TIME,
+        tzinfo=PUBLISH_TIMEZONE,
+    )
+    if local_now < start:
+        return start
+    if local_now >= end:
+        tomorrow = local_now.date() + timedelta(days=1)
+        return datetime.combine(
+            tomorrow,
+            PUBLISH_START_TIME,
+            tzinfo=PUBLISH_TIMEZONE,
+        )
+
+    elapsed = (local_now - start).total_seconds()
+    slot_number = int((elapsed + INTERVAL - 1) // INTERVAL)
+    candidate = start + timedelta(seconds=slot_number * INTERVAL)
+    if candidate >= end:
+        tomorrow = local_now.date() + timedelta(days=1)
+        return datetime.combine(
+            tomorrow,
+            PUBLISH_START_TIME,
+            tzinfo=PUBLISH_TIMEZONE,
+        )
+    return candidate
+
+
+def _within_publish_window(now):
+    local_now = now.astimezone(PUBLISH_TIMEZONE)
+    start = datetime.combine(
+        local_now.date(),
+        PUBLISH_START_TIME,
+        tzinfo=PUBLISH_TIMEZONE,
+    )
+    end = datetime.combine(
+        local_now.date(),
+        PUBLISH_END_TIME,
+        tzinfo=PUBLISH_TIMEZONE,
+    )
+    return start <= local_now < end
 
 
 # ---------------------------------------------------------------------------
@@ -640,13 +739,20 @@ def _force_manual_review(post_ids, claim_owner, error):
     )
 
 
-def process_next_post(claim_owner=None, session=None):
+def process_next_post(
+    claim_owner=None,
+    session=None,
+    enforce_publish_window=False,
+):
     """
     Claim and publish the next eligible unit.
 
     Returns:
       True  — published successfully (caller should wait INTERVAL)
       False — nothing published (empty/retry/failure/shutdown)
+
+    The scheduler loop sets enforce_publish_window so safe retries cannot
+    cross the configured daily closing time.
     """
     owner = claim_owner or _claim_owner
     if not owner:
@@ -705,6 +811,20 @@ def process_next_post(claim_owner=None, session=None):
     transient_delay = 5
     try:
         for attempt in range(1, TRANSIENT_ATTEMPTS + 1):
+            if enforce_publish_window and not _within_publish_window(
+                _now_ist()
+            ):
+                release_claim(
+                    database_ids,
+                    claim_owner=owner,
+                    error="Publishing window closed before retry",
+                    increment_retry=False,
+                )
+                _logger.info(
+                    "Released Post #%s to pending; publishing window closed.",
+                    post_number,
+                )
+                return False
             if _shutdown_requested:
                 release_claim(
                     database_ids,
@@ -891,27 +1011,39 @@ def process_next_post(claim_owner=None, session=None):
 
 
 def run_scheduler_loop(claim_owner=None, session=None):
-    """Run one publishing attempt per fixed interval slot."""
+    """Run at most one publishing attempt per daily IST interval slot."""
     owner = claim_owner or _claim_owner
     http = session or requests.Session()
     owns_session = session is None
-    next_publish_at = time.monotonic()
+    next_publish_at = _next_publish_slot(_now_ist())
 
     _logger.info(
-        "Scheduler loop starting. owner=%s interval=%ss empty_wait=%ss",
+        "Scheduler loop starting. owner=%s interval=%ss window=%s-%s IST",
         owner,
         INTERVAL,
-        EMPTY_QUEUE_CHECK_SECONDS,
+        PUBLISH_START_TIME.strftime("%H:%M"),
+        PUBLISH_END_TIME.strftime("%H:%M"),
     )
     print("Telegram scheduler started!")
 
     try:
         while not _shutdown_requested:
-            remaining = next_publish_at - time.monotonic()
+            now = _now_ist()
+            remaining = (next_publish_at - now).total_seconds()
             if remaining > 0:
                 _sleep_interruptible(
                     min(EMPTY_QUEUE_CHECK_SECONDS, remaining)
                 )
+                continue
+
+            if now >= next_publish_at + timedelta(
+                seconds=SLOT_START_GRACE_SECONDS
+            ):
+                _logger.info(
+                    "Missed publishing slot at %s IST; skipping catch-up.",
+                    next_publish_at.isoformat(),
+                )
+                next_publish_at = _next_publish_slot(now)
                 continue
 
             try:
@@ -919,9 +1051,12 @@ def run_scheduler_loop(claim_owner=None, session=None):
                     published = process_next_post(
                         claim_owner=owner,
                         session=http,
+                        enforce_publish_window=True,
                     )
                 finally:
-                    next_publish_at = time.monotonic() + INTERVAL
+                    next_publish_at = _next_publish_slot(
+                        _now_ist() + timedelta(seconds=1)
+                    )
 
                 if _shutdown_requested:
                     break
@@ -935,9 +1070,9 @@ def run_scheduler_loop(claim_owner=None, session=None):
                 else:
                     stats = get_queue_stats()
                     _logger.info(
-                        "No publish this slot. queue=%s; next slot in %ss",
+                        "No publish this slot. queue=%s; next slot at %s IST",
                         stats,
-                        INTERVAL,
+                        next_publish_at.isoformat(),
                     )
                     print(
                         "No eligible posts. Waiting for the next publish slot."
@@ -946,7 +1081,9 @@ def run_scheduler_loop(claim_owner=None, session=None):
             except Exception as exc:
                 _log_exception_safely("Scheduler loop error", exc)
                 print(f"Scheduler error: {sanitize_telegram_error(exc)}")
-                next_publish_at = time.monotonic() + INTERVAL
+                next_publish_at = _next_publish_slot(
+                    _now_ist() + timedelta(seconds=1)
+                )
     finally:
         if owns_session and hasattr(http, "close"):
             http.close()
