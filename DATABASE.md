@@ -200,14 +200,15 @@ Operational flow:
    failed)
 
 The scheduler publishes only during the configured daily window
-(`PUBLISH_START_TIME=08:00` inclusive to `PUBLISH_END_TIME=12:00` exclusive,
+(`PUBLISH_START_TIME=08:00` inclusive to `PUBLISH_END_TIME=00:00` exclusive,
 Asia/Kolkata by default), on 300-second slots. The first slot is 08:00 and
-the last is 11:55. Outside the window, the listener remains active and new
-rows stay pending; the scheduler does not clear pending rows or reset the
-cycle at closing time. A restart schedules the next valid slot, including
-08:00 when restarted outside publishing hours. Missed slots are skipped,
-never replayed as a burst. Queue priority, album atomicity, and retry rules
-apply normally at each slot.
+the last is 23:55; noon is within the window. From midnight through 07:59,
+the listener remains active and new rows stay pending; the scheduler does not
+clear pending rows or reset the cycle at closing time. A restart schedules
+the next valid slot, including 08:00 when restarted outside publishing hours.
+Missed slots are skipped, never replayed as a burst. An in-progress publish
+request may finish after midnight. Queue priority, album atomicity, and retry
+rules apply normally at each slot.
 
 ### Stale-claim recovery
 

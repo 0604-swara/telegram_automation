@@ -115,10 +115,10 @@ def validate_publish_schedule(start_value, end_value, interval):
     """Validate the configured daily local-time publishing schedule."""
     start = _parse_publish_time(start_value, "PUBLISH_START_TIME")
     end = _parse_publish_time(end_value, "PUBLISH_END_TIME")
-    if start >= end:
+    if start == end:
         raise ConfigurationError(
-            "PUBLISH_START_TIME and PUBLISH_END_TIME must define a window "
-            "with start earlier than end."
+            "PUBLISH_START_TIME and PUBLISH_END_TIME must define a "
+            "non-empty publishing window; equal times are not supported."
         )
     if interval < 1:
         raise ConfigurationError("PUBLISH_INTERVAL_SECONDS must be positive.")
@@ -128,13 +128,13 @@ def validate_publish_schedule(start_value, end_value, interval):
 try:
     PUBLISH_START_TIME, PUBLISH_END_TIME = validate_publish_schedule(
         os.getenv("PUBLISH_START_TIME", "08:00"),
-        os.getenv("PUBLISH_END_TIME", "12:00"),
+        os.getenv("PUBLISH_END_TIME", "00:00"),
         INTERVAL,
     )
 except ConfigurationError as exc:
     _CONFIGURATION_ERRORS.append(str(exc))
     PUBLISH_START_TIME = datetime_time(8, 0)
-    PUBLISH_END_TIME = datetime_time(12, 0)
+    PUBLISH_END_TIME = datetime_time(0, 0)
 
 _logger = logging.getLogger("scheduler")
 _shutdown_requested = False
@@ -290,33 +290,58 @@ def _now_ist():
 def _next_publish_slot(now):
     """Return the next interval-aligned slot, inclusive, in Asia/Kolkata."""
     local_now = now.astimezone(PUBLISH_TIMEZONE)
-    start = datetime.combine(
-        local_now.date(),
-        PUBLISH_START_TIME,
-        tzinfo=PUBLISH_TIMEZONE,
-    )
-    end = datetime.combine(
-        local_now.date(),
-        PUBLISH_END_TIME,
-        tzinfo=PUBLISH_TIMEZONE,
-    )
-    if local_now < start:
-        return start
-    if local_now >= end:
-        tomorrow = local_now.date() + timedelta(days=1)
-        return datetime.combine(
-            tomorrow,
+    local_time = local_now.timetz().replace(tzinfo=None)
+    crosses_midnight = PUBLISH_START_TIME > PUBLISH_END_TIME
+
+    if crosses_midnight:
+        if local_time >= PUBLISH_START_TIME:
+            window_start_date = local_now.date()
+        elif local_time < PUBLISH_END_TIME:
+            window_start_date = local_now.date() - timedelta(days=1)
+        else:
+            return datetime.combine(
+                local_now.date(),
+                PUBLISH_START_TIME,
+                tzinfo=PUBLISH_TIMEZONE,
+            )
+        start = datetime.combine(
+            window_start_date,
             PUBLISH_START_TIME,
             tzinfo=PUBLISH_TIMEZONE,
         )
+        end = datetime.combine(
+            window_start_date + timedelta(days=1),
+            PUBLISH_END_TIME,
+            tzinfo=PUBLISH_TIMEZONE,
+        )
+    else:
+        start = datetime.combine(
+            local_now.date(),
+            PUBLISH_START_TIME,
+            tzinfo=PUBLISH_TIMEZONE,
+        )
+        end = datetime.combine(
+            local_now.date(),
+            PUBLISH_END_TIME,
+            tzinfo=PUBLISH_TIMEZONE,
+        )
+        if local_now < start:
+            return start
+        if local_now >= end:
+            tomorrow = local_now.date() + timedelta(days=1)
+            return datetime.combine(
+                tomorrow,
+                PUBLISH_START_TIME,
+                tzinfo=PUBLISH_TIMEZONE,
+            )
 
     elapsed = (local_now - start).total_seconds()
     slot_number = int((elapsed + INTERVAL - 1) // INTERVAL)
     candidate = start + timedelta(seconds=slot_number * INTERVAL)
     if candidate >= end:
-        tomorrow = local_now.date() + timedelta(days=1)
+        next_start_date = start.date() + timedelta(days=1)
         return datetime.combine(
-            tomorrow,
+            next_start_date,
             PUBLISH_START_TIME,
             tzinfo=PUBLISH_TIMEZONE,
         )
@@ -325,17 +350,13 @@ def _next_publish_slot(now):
 
 def _within_publish_window(now):
     local_now = now.astimezone(PUBLISH_TIMEZONE)
-    start = datetime.combine(
-        local_now.date(),
-        PUBLISH_START_TIME,
-        tzinfo=PUBLISH_TIMEZONE,
-    )
-    end = datetime.combine(
-        local_now.date(),
-        PUBLISH_END_TIME,
-        tzinfo=PUBLISH_TIMEZONE,
-    )
-    return start <= local_now < end
+    local_time = local_now.timetz().replace(tzinfo=None)
+    if PUBLISH_START_TIME > PUBLISH_END_TIME:
+        return (
+            local_time >= PUBLISH_START_TIME
+            or local_time < PUBLISH_END_TIME
+        )
+    return PUBLISH_START_TIME <= local_time < PUBLISH_END_TIME
 
 
 # ---------------------------------------------------------------------------

@@ -23,7 +23,7 @@ TEST_SETTINGS = {
     "SCHEDULER_LOCK_FILE": "scheduler_test.lock",
     "PUBLISH_INTERVAL_SECONDS": "30",
     "PUBLISH_START_TIME": "08:00",
-    "PUBLISH_END_TIME": "12:00",
+    "PUBLISH_END_TIME": "00:00",
     "EMPTY_QUEUE_CHECK_SECONDS": "7",
     "ALBUM_WAIT_SECONDS": "3",
     "MAX_PUBLISH_RETRIES": "5",
@@ -168,7 +168,7 @@ class SchedulerPhase7Tests(unittest.TestCase):
         )
         self.assertEqual(
             self.scheduler.PUBLISH_END_TIME.strftime("%H:%M"),
-            "12:00",
+            "00:00",
         )
 
         self._validate_test_environment()
@@ -196,7 +196,7 @@ class SchedulerPhase7Tests(unittest.TestCase):
         self.assertEqual(scheduler.EMPTY_QUEUE_CHECK_SECONDS, 30)
         self.assertEqual(scheduler.ALBUM_WAIT_SECONDS, 15)
         self.assertEqual(scheduler.PUBLISH_START_TIME.strftime("%H:%M"), "08:00")
-        self.assertEqual(scheduler.PUBLISH_END_TIME.strftime("%H:%M"), "12:00")
+        self.assertEqual(scheduler.PUBLISH_END_TIME.strftime("%H:%M"), "00:00")
         self._validate_test_environment()
 
     def test_invalid_interval_settings_are_rejected_safely(self):
@@ -209,7 +209,7 @@ class SchedulerPhase7Tests(unittest.TestCase):
             ("ALBUM_WAIT_SECONDS", "not-a-number"),
             ("ALBUM_WAIT_SECONDS", "-1"),
             ("PUBLISH_START_TIME", "8:00"),
-            ("PUBLISH_START_TIME", "12:00"),
+            ("PUBLISH_START_TIME", "00:00"),
             ("PUBLISH_END_TIME", "08:00"),
             ("PUBLISH_END_TIME", "25:00"),
         )
@@ -228,37 +228,112 @@ class SchedulerPhase7Tests(unittest.TestCase):
                 self.assertIn(name, str(raised.exception))
                 self.assertNotIn(TEST_SETTINGS["TELEGRAM_BOT_TOKEN"], str(raised.exception))
 
-    def test_daily_window_slots_use_ist_and_end_before_noon(self):
+    def test_overnight_window_bounds_and_slots_use_ist(self):
         self._reload_scheduler({"PUBLISH_INTERVAL_SECONDS": "300"})
         timezone = ZoneInfo("Asia/Kolkata")
         day = datetime(2026, 11, 7, tzinfo=timezone)
-        slots = (
-            (day.replace(hour=7, minute=59), day.replace(hour=8)),
-            (day.replace(hour=8), day.replace(hour=8)),
+        checks = (
+            (day.replace(hour=7, minute=59), False, day.replace(hour=8)),
+            (day.replace(hour=8), True, day.replace(hour=8)),
             (
                 day.replace(hour=8, minute=0, second=1),
+                True,
                 day.replace(hour=8, minute=5),
             ),
+            (day.replace(hour=11, minute=55), True, day.replace(hour=11, minute=55)),
+            (day.replace(hour=12), True, day.replace(hour=12)),
+            (day.replace(hour=15), True, day.replace(hour=15)),
+            (day.replace(hour=23, minute=55), True, day.replace(hour=23, minute=55)),
             (
-                day.replace(hour=11, minute=55),
-                day.replace(hour=11, minute=55),
-            ),
-            (
-                day.replace(hour=11, minute=55, second=1),
+                day.replace(hour=23, minute=59),
+                True,
                 (day + timedelta(days=1)).replace(hour=8),
             ),
             (
-                day.replace(hour=12),
+                (day + timedelta(days=1)).replace(hour=0),
+                False,
+                (day + timedelta(days=1)).replace(hour=8),
+            ),
+            (
+                (day + timedelta(days=1)).replace(hour=0, minute=5),
+                False,
+                (day + timedelta(days=1)).replace(hour=8),
+            ),
+            (
+                (day + timedelta(days=1)).replace(hour=7, minute=55),
+                False,
+                (day + timedelta(days=1)).replace(hour=8),
+            ),
+            (
+                (day + timedelta(days=1)).replace(hour=8),
+                True,
                 (day + timedelta(days=1)).replace(hour=8),
             ),
         )
-        for current, expected in slots:
+        for current, expected_active, expected_slot in checks:
             with self.subTest(current=current):
+                self.assertEqual(
+                    self.scheduler._within_publish_window(current),
+                    expected_active,
+                )
                 result = self.scheduler._next_publish_slot(current)
-                self.assertEqual(result, expected)
+                self.assertEqual(result, expected_slot)
                 self.assertEqual(result.tzinfo, timezone)
+                self.assertEqual(result.utcoffset(), timedelta(hours=5, minutes=30))
 
-    def test_restart_outside_window_waits_until_0800_and_keeps_queue(self):
+        utc_input = datetime(2026, 11, 7, 2, 30, tzinfo=ZoneInfo("UTC"))
+        self.assertEqual(
+            self.scheduler._next_publish_slot(utc_input),
+            day.replace(hour=8),
+        )
+
+    def test_restarts_resolve_to_next_eligible_ist_slot(self):
+        scheduler = self._reload_scheduler(
+            {
+                "TELEGRAM_TEST_MODE": "0",
+                "PUBLISH_INTERVAL_SECONDS": "300",
+                "EMPTY_QUEUE_CHECK_SECONDS": "30000",
+            }
+        )
+        timezone = ZoneInfo("Asia/Kolkata")
+        day = datetime(2026, 11, 7, tzinfo=timezone)
+        cases = (
+            (day.replace(hour=2), day.replace(hour=8)),
+            (day.replace(hour=9), day.replace(hour=9)),
+            (
+                day.replace(hour=23, minute=58),
+                (day + timedelta(days=1)).replace(hour=8),
+            )
+        )
+        for start_now, expected_attempt in cases:
+            with self.subTest(restart=start_now):
+                now = {"value": start_now}
+                attempts = []
+
+                def fake_sleep(seconds):
+                    now["value"] += timedelta(seconds=seconds)
+
+                def fake_attempt(*args, **kwargs):
+                    attempts.append(now["value"])
+                    scheduler.request_shutdown()
+                    return False
+
+                scheduler._shutdown_requested = False
+                with (
+                    patch.object(scheduler, "_now_ist", side_effect=lambda: now["value"]),
+                    patch.object(scheduler, "_sleep_interruptible", side_effect=fake_sleep),
+                    patch.object(scheduler, "process_next_post", side_effect=fake_attempt),
+                    patch.object(scheduler, "record_heartbeat"),
+                    patch.object(scheduler, "get_queue_stats", return_value={}),
+                ):
+                    scheduler.run_scheduler_loop(
+                        claim_owner="scheduler-window-restart",
+                        session=MagicMock(),
+                    )
+
+                self.assertEqual(attempts, [expected_attempt])
+
+    def test_restart_outside_window_keeps_pending_posts(self):
         scheduler = self._reload_scheduler(
             {
                 "TELEGRAM_TEST_MODE": "0",
@@ -268,18 +343,16 @@ class SchedulerPhase7Tests(unittest.TestCase):
         )
         post_id = self._insert_post(808)
         timezone = ZoneInfo("Asia/Kolkata")
-        now = {"value": datetime(2026, 11, 7, 12, 0, tzinfo=timezone)}
-        attempts = []
+        now = {"value": datetime(2026, 11, 7, 2, 0, tzinfo=timezone)}
+        scheduler._shutdown_requested = False
 
         def fake_sleep(seconds):
             now["value"] += timedelta(seconds=seconds)
 
         def fake_attempt(*args, **kwargs):
-            attempts.append(now["value"])
             scheduler.request_shutdown()
             return False
 
-        scheduler._shutdown_requested = False
         with (
             patch.object(scheduler, "_now_ist", side_effect=lambda: now["value"]),
             patch.object(scheduler, "_sleep_interruptible", side_effect=fake_sleep),
@@ -292,11 +365,7 @@ class SchedulerPhase7Tests(unittest.TestCase):
                 session=MagicMock(),
             )
 
-        self.assertEqual(
-            attempts,
-            [datetime(2026, 11, 8, 8, 0, tzinfo=timezone)],
-        )
-        self.assertEqual(self._statuses(), {808: "pending"})
+        self.assertEqual(now["value"], datetime(2026, 11, 7, 8, 0, tzinfo=timezone))
         with self.database.get_connection() as conn:
             row = conn.execute(
                 "SELECT status FROM incoming_posts WHERE id=?",
@@ -341,20 +410,20 @@ class SchedulerPhase7Tests(unittest.TestCase):
             [datetime(2026, 11, 7, 8, 5, tzinfo=timezone)],
         )
 
-    def test_retry_after_window_close_does_not_send_after_noon(self):
+    def test_retry_after_window_close_does_not_send_after_midnight(self):
         scheduler = self._reload_scheduler(
             {
                 "PUBLISH_INTERVAL_SECONDS": "300",
                 "PUBLISH_START_TIME": "08:00",
-                "PUBLISH_END_TIME": "12:00",
+                "PUBLISH_END_TIME": "00:00",
             }
         )
         self._insert_post(809)
         timezone = ZoneInfo("Asia/Kolkata")
         scheduler._now_ist = MagicMock(
             side_effect=[
-                datetime(2026, 11, 7, 11, 55, tzinfo=timezone),
-                datetime(2026, 11, 7, 12, 0, tzinfo=timezone),
+                datetime(2026, 11, 7, 23, 55, tzinfo=timezone),
+                datetime(2026, 11, 8, 0, 0, tzinfo=timezone),
             ]
         )
         scheduler._shutdown_requested = False
@@ -381,6 +450,36 @@ class SchedulerPhase7Tests(unittest.TestCase):
                 "SELECT retry_count FROM incoming_posts WHERE message_id=809"
             ).fetchone()
         self.assertEqual(row["retry_count"], 0)
+
+    def test_in_progress_publish_can_finish_after_window_closes(self):
+        scheduler = self._reload_scheduler(
+            {
+                "PUBLISH_INTERVAL_SECONDS": "300",
+                "PUBLISH_START_TIME": "08:00",
+                "PUBLISH_END_TIME": "00:00",
+            }
+        )
+        self._insert_post(810)
+        timezone = ZoneInfo("Asia/Kolkata")
+        now = {"value": datetime(2026, 11, 7, 23, 55, tzinfo=timezone)}
+
+        def finish_after_midnight(*args, **kwargs):
+            now["value"] = datetime(2026, 11, 8, 0, 0, tzinfo=timezone)
+            return [9810]
+
+        scheduler._shutdown_requested = False
+        with (
+            patch.object(scheduler, "_now_ist", side_effect=lambda: now["value"]),
+            patch.object(scheduler, "publish_single", side_effect=finish_after_midnight),
+        ):
+            result = scheduler.process_next_post(
+                claim_owner="scheduler-midnight-inflight",
+                session=MagicMock(),
+                enforce_publish_window=True,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(self._statuses(), {810: "published"})
 
     def test_zero_album_wait_is_allowed_for_controlled_tests(self):
         scheduler = self._reload_scheduler({"ALBUM_WAIT_SECONDS": "0"})
@@ -432,7 +531,7 @@ class SchedulerPhase7Tests(unittest.TestCase):
             "scheduler-phase7-test",
             30,
             "08:00",
-            "12:00",
+            "00:00",
         )
 
     def test_scheduler_uses_five_minute_slots_while_idle(self):

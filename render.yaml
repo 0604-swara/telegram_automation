@@ -25,7 +25,7 @@ services:
       - key: PUBLISH_START_TIME
         value: "08:00"
       - key: PUBLISH_END_TIME
-        value: "12:00"
+        value: "00:00"
       - key: EMPTY_QUEUE_CHECK_SECONDS
         value: "30"
       - key: ALBUM_WAIT_SECONDS

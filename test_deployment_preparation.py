@@ -489,6 +489,8 @@ class DeploymentPreparationTests(unittest.TestCase):
                 "DESTINATION_CHANNEL_ID": "-100444555666",
                 "DB_PATH": str(mount / "telegram_queue.db"),
                 "PUBLISH_INTERVAL_SECONDS": "300",
+                "PUBLISH_START_TIME": "08:00",
+                "PUBLISH_END_TIME": "00:00",
                 "SCHEDULER_LOCK_FILE": str(mount / "scheduler.lock"),
                 "LISTENER_LOCK_FILE": str(mount / "listener.lock"),
                 "PROCESS_MANAGER_LOCK_FILE": str(
@@ -503,6 +505,15 @@ class DeploymentPreparationTests(unittest.TestCase):
                     disk_path=mount,
                 )
                 self.assertEqual(result["DB_PATH"], settings["DB_PATH"])
+
+                settings_with_defaults = dict(settings)
+                settings_with_defaults.pop("PUBLISH_START_TIME")
+                settings_with_defaults.pop("PUBLISH_END_TIME")
+                default_result = process_manager.validate_render_settings(
+                    settings_with_defaults,
+                    disk_path=mount,
+                )
+                self.assertEqual(default_result["DB_PATH"], settings["DB_PATH"])
 
                 invalid_settings = dict(settings)
                 invalid_settings["TELEGRAM_TEST_MODE"] = "1"
@@ -705,6 +716,7 @@ class DeploymentPreparationTests(unittest.TestCase):
     def test_render_yaml_configures_one_worker_and_one_disk(self):
         repository = Path(__file__).resolve().parent
         blueprint = (repository / "render.yaml").read_text()
+        env_example = (repository / ".env.example").read_text()
         self.assertEqual(blueprint.count("type: worker"), 1)
         self.assertIn("numInstances: 1", blueprint)
         self.assertIn("mountPath: /var/data", blueprint)
@@ -713,8 +725,12 @@ class DeploymentPreparationTests(unittest.TestCase):
         self.assertIn("PUBLISH_START_TIME", blueprint)
         self.assertIn('value: "08:00"', blueprint)
         self.assertIn("PUBLISH_END_TIME", blueprint)
-        self.assertIn('value: "12:00"', blueprint)
+        self.assertIn('value: "00:00"', blueprint)
+        self.assertIn('value: "300"', blueprint)
         self.assertIn("sync: false", blueprint)
+        self.assertIn("PUBLISH_INTERVAL_SECONDS=300", env_example)
+        self.assertIn("PUBLISH_START_TIME=08:00", env_example)
+        self.assertIn("PUBLISH_END_TIME=00:00", env_example)
 
     def test_render_preflight_rejects_missing_credentials_and_channel_ids(self):
         with tempfile.TemporaryDirectory() as temporary:

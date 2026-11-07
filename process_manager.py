@@ -128,7 +128,7 @@ def validate_render_settings(env=None, disk_path=None):
         )
     validate_publish_schedule(
         settings.get("PUBLISH_START_TIME", "08:00"),
-        settings.get("PUBLISH_END_TIME", "12:00"),
+        settings.get("PUBLISH_END_TIME", "00:00"),
         int(interval),
     )
 
