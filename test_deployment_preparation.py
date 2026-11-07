@@ -281,6 +281,14 @@ class DeploymentPreparationTests(unittest.TestCase):
                         connection,
                         "go_live_cutoff",
                     )
+                    bootstrap_status = database._get_state(
+                        connection,
+                        "go_live_bootstrap_status",
+                    )
+                    first_update_id = database._get_state(
+                        connection,
+                        "go_live_first_update_id",
+                    )
                     history_exists = connection.execute(
                         "SELECT 1 FROM sqlite_master "
                         "WHERE type='table' AND name='publish_history'"
@@ -291,7 +299,9 @@ class DeploymentPreparationTests(unittest.TestCase):
                 self.assertEqual(state, "177")
                 self.assertEqual(version, database.SCHEMA_VERSION)
                 self.assertEqual(eligibility, 0)
-                self.assertTrue(int(go_live_cutoff) > 0)
+                self.assertIsNone(go_live_cutoff)
+                self.assertEqual(bootstrap_status, database.GO_LIVE_PENDING)
+                self.assertEqual(first_update_id, "")
                 self.assertIsNotNone(history_exists)
             finally:
                 database.DB_NAME = previous

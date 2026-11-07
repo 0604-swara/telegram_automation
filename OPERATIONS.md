@@ -30,18 +30,34 @@ Optional: `PUBLISH_INTERVAL_SECONDS` (default 300), `STALE_CLAIM_SECONDS` (900),
 
 ## New posts and publishing schedule
 
-Only posts received after the persisted go-live cutoff are eligible. The
-client must upload to the configured private source channel. The bot must be
-an administrator allowed to receive channel posts there, and must have
-permission to publish/copy messages to the configured destination channel.
-Text, single photos with captions, and photo albums are supported; album
-members remain grouped.
+Only posts received after the persisted Telegram update-ID boundary are
+eligible. The client must upload to the configured private source channel.
+The bot must be an administrator allowed to receive channel posts there, and
+must have permission to publish/copy messages to the configured destination
+channel. Text, single photos with captions, and photo albums are supported;
+album members remain grouped.
 
-Historical channel posts are not fetched or imported. Pending Bot API updates
-with message dates at or before the go-live cutoff are skipped, and existing
-database rows are retained but ineligible for publishing. The cutoff persists
-through restarts. Telegram message dates have one-second resolution; posts in
-the same timestamp second as the cutoff are conservatively excluded.
+Historical channel posts are not fetched or imported. At first production
+startup, after schema initialization and before either child starts, the
+process manager persists a `capturing` state and makes one bounded
+`getUpdates(offset=-1, timeout=0)` call. The newest pending update returned
+defines the last excluded update; the worker stores the next update ID as its
+listener offset. An empty response establishes the boundary at that response:
+updates arriving afterward remain eligible. Same-second message timestamps
+do not affect eligibility. Existing database rows are retained but marked
+ineligible.
+
+Once bootstrap state is `ready`, restarts never recalculate the boundary and
+resume from the persisted offset. If the process crashes or loses the request
+response while state is `capturing`, startup fails closed because Telegram may
+have discarded pending updates while SQLite did not record the boundary.
+HTTP 409 webhook conflicts are recorded and also block startup. Resolve the
+webhook or manually inspect the intended update boundary, then explicitly
+recover with `database.recover_go_live_bootstrap(boundary_update_id,
+operator_confirmed=True)`; pass `None` only after confirming an empty pending
+queue. This manual decision can intentionally exclude posts through the
+chosen boundary. Telegram and SQLite cannot share a transaction, so exactly
+once processing or strict no-loss guarantees are not claimed.
 
 The scheduler checks an initial slot at startup and then attempts at most one
 publish unit every five minutes. Empty slots are skipped; new arrivals wait
@@ -49,14 +65,27 @@ for the next slot and take priority according to newest-first ordering.
 
 ## Start
 
-Run in **two separate terminals**:
+For production, start only `process_manager.py` (Render's configured command).
+It validates the persistent disk and production settings, initializes or
+migrates the database, establishes the one-time Telegram update-ID boundary,
+then launches exactly one listener and scheduler with the same database path.
+Do not start production child processes separately.
+
+```powershell
+python process_manager.py
+```
+
+For isolated local development only, the child processes can be run in
+separate terminals after the configured database already has a `ready`
+go-live boundary:
 
 ```powershell
 python telegram_handler.py
 python scheduler.py
 ```
 
-Only one scheduler instance can run (`scheduler.lock`). The listener also takes a non-blocking single-instance lock (`listener.lock`).
+Only one process manager can run. The scheduler and listener also acquire
+their own non-blocking single-instance locks.
 
 ## Stop
 
@@ -156,10 +185,17 @@ the absence of a local success record.
 
 ## Safe restart
 
-1. Stop scheduler (`Ctrl+C`), then listener.
-2. Optionally run `python healthcheck.py` and create a backup.
-3. Start listener, then scheduler.
-4. On scheduler startup, stale `publishing` claims older than the lease window are moved to `failed` for manual review (not auto-republished).
+In production, restart the single worker. The process manager resumes from the
+persisted update offset and does not recalculate a `ready` boundary. Do not
+clear bootstrap state or manually reset the update offset.
+
+For isolated local child processes, stop the scheduler and listener, optionally
+run `python healthcheck.py` and create a backup, then restart both only after
+confirming the boundary remains `ready`. Stale `publishing` claims older than
+the lease window are moved to `failed` for manual review, not auto-republished.
+If bootstrap is left `capturing` or records a webhook conflict, startup is
+blocked; follow the explicit boundary-recovery procedure above rather than
+restarting blindly.
 
 ## Regression tests (isolated; no live Telegram)
 

@@ -71,7 +71,16 @@ class ListenerRegressionTests(unittest.TestCase):
             conn.execute(
                 "DELETE FROM bot_state WHERE key = 'update_offset'"
             )
-            self.database._set_state(conn, "go_live_cutoff", 0)
+            self.database._set_state(
+                conn,
+                "go_live_bootstrap_status",
+                self.database.GO_LIVE_READY,
+            )
+            self.database._set_state(
+                conn,
+                "go_live_first_update_id",
+                0,
+            )
             self.database._commit(conn)
 
     @staticmethod
@@ -103,6 +112,24 @@ class ListenerRegressionTests(unittest.TestCase):
 
     def _ingest_album(self):
         return self.handler.process_updates(self._album_updates())
+
+    def _prepare_go_live_bootstrap(self):
+        with self.database.get_connection() as conn:
+            self.database._begin_immediate(conn)
+            self.database._set_state(
+                conn,
+                "go_live_bootstrap_status",
+                self.database.GO_LIVE_PENDING,
+            )
+            self.database._set_state(
+                conn,
+                "go_live_first_update_id",
+                "",
+            )
+            conn.execute(
+                "DELETE FROM bot_state WHERE key = 'update_offset'"
+            )
+            self.database._commit(conn)
 
     def test_album_caption_and_shared_media_group_are_stored(self):
         latest_offset = self._ingest_album()
@@ -176,7 +203,11 @@ class ListenerRegressionTests(unittest.TestCase):
     def test_pre_live_pending_update_is_ignored_but_offset_advances(self):
         with self.database.get_connection() as conn:
             self.database._begin_immediate(conn)
-            self.database._set_state(conn, "go_live_cutoff", 100)
+            self.database._set_state(
+                conn,
+                "go_live_first_update_id",
+                1202,
+            )
             self.database._commit(conn)
 
         result = self.database.process_telegram_update(
@@ -201,6 +232,303 @@ class ListenerRegressionTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM incoming_posts"
             ).fetchone()[0]
         self.assertEqual(count, 0)
+
+    def test_new_same_second_update_after_boundary_is_accepted(self):
+        with self.database.get_connection() as conn:
+            self.database._begin_immediate(conn)
+            self.database._set_state(
+                conn,
+                "go_live_first_update_id",
+                1500,
+            )
+            self.database._commit(conn)
+
+        result = self.database.process_telegram_update(
+            {
+                "update_id": 1500,
+                "channel_post": {
+                    "message_id": 950,
+                    "chat": {"id": -100111},
+                    "date": 100,
+                    "text": "Same-second go-live post",
+                    "media_group_id": None,
+                },
+            },
+            "-100111",
+        )
+        self.assertTrue(result["inserted"])
+        self.assertFalse(result["pre_live_ignored"])
+        with self.database.get_connection() as conn:
+            row = conn.execute(
+                "SELECT message_id, live_eligible FROM incoming_posts"
+            ).fetchone()
+        self.assertEqual(tuple(row), (950, 1))
+
+    def test_non_source_channel_update_is_ignored_and_offset_advances(self):
+        result = self.database.process_telegram_update(
+            {
+                "update_id": 1550,
+                "channel_post": {
+                    "message_id": 951,
+                    "chat": {"id": -100999},
+                    "date": 100,
+                    "text": "Not the configured source",
+                },
+            },
+            "-100111",
+        )
+        self.assertTrue(result["ignored"])
+        self.assertFalse(result["inserted"])
+        self.assertEqual(self.database.get_offset(), 1551)
+        with self.database.get_connection() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM incoming_posts"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_duplicate_update_replay_does_not_duplicate_post(self):
+        update = {
+            "update_id": 1560,
+            "channel_post": {
+                "message_id": 952,
+                "chat": {"id": -100111},
+                "date": 100,
+                "text": "Replay-safe source post",
+            },
+        }
+        first = self.database.process_telegram_update(update, "-100111")
+        second = self.database.process_telegram_update(update, "-100111")
+        self.assertTrue(first["inserted"])
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(self.database.get_offset(), 1561)
+        with self.database.get_connection() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM incoming_posts WHERE message_id=952"
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_bootstrap_bounds_more_than_one_hundred_pending_updates(self):
+        self._prepare_go_live_bootstrap()
+        pending = [
+            {"update_id": update_id}
+            for update_id in range(5000, 5250)
+        ]
+        session = MagicMock()
+        session.get.return_value.status_code = 200
+        session.get.return_value.json.return_value = {
+            "ok": True,
+            "result": pending[-1:],
+        }
+
+        first_eligible = self.handler.bootstrap_go_live_boundary(session)
+
+        self.assertEqual(first_eligible, 5250)
+        self.assertEqual(session.get.call_count, 1)
+        params = session.get.call_args.kwargs["params"]
+        self.assertEqual(params["offset"], -1)
+        self.assertEqual(params["timeout"], 0)
+        self.assertEqual(self.database.get_offset(), 5250)
+
+    def test_empty_bootstrap_accepts_updates_arriving_after_boundary(self):
+        self._prepare_go_live_bootstrap()
+        session = MagicMock()
+        session.get.return_value.status_code = 200
+        session.get.return_value.json.return_value = {
+            "ok": True,
+            "result": [],
+        }
+
+        first_eligible = self.handler.bootstrap_go_live_boundary(session)
+        self.assertIsNone(first_eligible)
+        self.assertIsNone(self.database.get_offset())
+
+        result = self.database.process_telegram_update(
+            {
+                "update_id": 6300,
+                "channel_post": {
+                    "message_id": 960,
+                    "chat": {"id": -100111},
+                    "date": 100,
+                    "text": "Arrived after empty boundary",
+                },
+            },
+            "-100111",
+        )
+        self.assertTrue(result["inserted"])
+        self.assertEqual(self.database.get_offset(), 6301)
+
+    def test_update_arriving_during_startup_after_boundary_is_preserved(self):
+        self._prepare_go_live_bootstrap()
+        session = MagicMock()
+        session.get.return_value.status_code = 200
+        session.get.return_value.json.return_value = {
+            "ok": True,
+            "result": [{"update_id": 7000}],
+        }
+
+        first_eligible = self.handler.bootstrap_go_live_boundary(session)
+        # Simulates the server queuing a post after its boundary response but
+        # before the listener child starts polling.
+        self.assertEqual(first_eligible, 7001)
+        result = self.database.process_telegram_update(
+            {
+                "update_id": 7001,
+                "channel_post": {
+                    "message_id": 970,
+                    "chat": {"id": -100111},
+                    "date": 100,
+                    "text": "Arrived during child startup",
+                },
+            },
+            "-100111",
+        )
+        self.assertTrue(result["inserted"])
+
+    def test_ambiguous_bootstrap_crash_requires_manual_recovery(self):
+        self._prepare_go_live_bootstrap()
+        self.database.begin_go_live_bootstrap()
+        session = MagicMock()
+        with self.assertRaises(self.database.DatabaseError):
+            self.handler.bootstrap_go_live_boundary(session)
+        session.get.assert_not_called()
+        self.assertEqual(
+            self.database.get_go_live_state()["status"],
+            self.database.GO_LIVE_CAPTURING,
+        )
+        with self.assertRaisesRegex(
+            self.database.DatabaseError,
+            "explicit operator confirmation",
+        ):
+            self.database.recover_go_live_bootstrap(8000)
+        self.database.recover_go_live_bootstrap(
+            8000,
+            operator_confirmed=True,
+        )
+        self.assertEqual(self.database.get_offset(), 8001)
+
+    def test_successful_bootstrap_is_not_recalculated_after_restart(self):
+        self._prepare_go_live_bootstrap()
+        session = MagicMock()
+        session.get.return_value.status_code = 200
+        session.get.return_value.json.return_value = {
+            "ok": True,
+            "result": [{"update_id": 9000}],
+        }
+        self.assertEqual(
+            self.handler.bootstrap_go_live_boundary(session),
+            9001,
+        )
+        self.assertEqual(
+            self.handler.bootstrap_go_live_boundary(session),
+            9001,
+        )
+        session.get.assert_called_once()
+
+    def test_webhook_conflict_blocks_bootstrap_until_manual_recovery(self):
+        self._prepare_go_live_bootstrap()
+        session = MagicMock()
+        session.get.return_value.status_code = 409
+        session.get.return_value.json.return_value = {
+            "ok": False,
+            "description": "webhook conflict",
+        }
+        with self.assertRaisesRegex(
+            self.handler.GoLiveBootstrapError,
+            "webhook",
+        ):
+            self.handler.bootstrap_go_live_boundary(session)
+        self.assertEqual(
+            self.database.get_go_live_state()["status"],
+            self.database.GO_LIVE_WEBHOOK_CONFLICT,
+        )
+        with self.assertRaises(self.database.DatabaseError):
+            self.handler.bootstrap_go_live_boundary(session)
+        self.database.recover_go_live_bootstrap(
+            9100,
+            operator_confirmed=True,
+        )
+        self.assertEqual(self.database.get_offset(), 9101)
+
+    def test_telegram_api_error_leaves_bootstrap_blocked(self):
+        self._prepare_go_live_bootstrap()
+        session = MagicMock()
+        session.get.return_value.status_code = 400
+        session.get.return_value.json.return_value = {
+            "ok": False,
+            "description": "invalid getUpdates request",
+        }
+
+        with self.assertRaisesRegex(
+            self.handler.GoLiveBootstrapError,
+            "ambiguous",
+        ):
+            self.handler.bootstrap_go_live_boundary(session)
+
+        self.assertEqual(
+            self.database.get_go_live_state()["status"],
+            self.database.GO_LIVE_CAPTURING,
+        )
+        with self.assertRaises(self.database.DatabaseError):
+            self.handler.bootstrap_go_live_boundary(session)
+        self.assertEqual(session.get.call_count, 1)
+
+    def test_listener_refuses_to_poll_before_bootstrap_is_ready(self):
+        with (
+            patch.object(self.handler, "install_signal_handlers"),
+            patch.object(
+                self.handler,
+                "require_go_live_ready",
+                side_effect=self.database.DatabaseError(
+                    "bootstrap is not ready"
+                ),
+            ),
+            patch.object(self.handler, "fetch_updates") as fetch_updates,
+        ):
+            with self.assertRaisesRegex(
+                self.database.DatabaseError,
+                "bootstrap is not ready",
+            ):
+                self.handler.listen_to_channel()
+
+        fetch_updates.assert_not_called()
+
+    def test_offset_failure_rolls_back_post_insert(self):
+        original_set_state = self.database._set_state
+
+        def fail_update_offset(conn, key, value):
+            if key == "update_offset":
+                raise self.database.DatabaseError(
+                    "simulated offset persistence failure"
+                )
+            return original_set_state(conn, key, value)
+
+        with patch.object(
+            self.database,
+            "_set_state",
+            side_effect=fail_update_offset,
+        ):
+            with self.assertRaisesRegex(
+                self.database.DatabaseError,
+                "simulated offset persistence failure",
+            ):
+                self.database.process_telegram_update(
+                    {
+                        "update_id": 9200,
+                        "channel_post": {
+                            "message_id": 980,
+                            "chat": {"id": -100111},
+                            "date": 100,
+                            "text": "Must rollback atomically",
+                        },
+                    },
+                    "-100111",
+                )
+        with self.database.get_connection() as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM incoming_posts WHERE message_id=980"
+            ).fetchone()[0]
+        self.assertEqual(count, 0)
+        self.assertIsNone(self.database.get_offset())
 
     def test_listener_polls_channel_posts_only_not_channel_history(self):
         response = MagicMock()

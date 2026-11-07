@@ -20,6 +20,10 @@ from config import (
 )
 from database import DB_NAME, DatabaseError, initialize_database
 from scheduler import SchedulerError, SingleInstanceLock
+from telegram_handler import (
+    GoLiveBootstrapError,
+    bootstrap_go_live_boundary,
+)
 
 _LOGGER = logging.getLogger("process-manager")
 _TERMINATE_TIMEOUT_SECONDS = 75
@@ -293,13 +297,19 @@ def main():
         manager_lock.acquire()
 
         initialize_database()
+        first_update_id = bootstrap_go_live_boundary()
         _LOGGER.info(
-            "Worker initialized. listener and scheduler share DB_PATH=%s.",
+            "Worker initialized. listener and scheduler share DB_PATH=%s; "
+            "first eligible update_id=%s.",
             production_paths["DB_PATH"],
+            first_update_id if first_update_id is not None else "next update",
         )
 
         commands = _worker_commands(production_paths["DB_PATH"])
         return run_processes(commands, stop_event=_STOP_EVENT)
+    except GoLiveBootstrapError as error:
+        _LOGGER.error("Worker go-live bootstrap failed: %s", error)
+        return 1
     except (ConfigurationError, DatabaseError, SchedulerError, OSError):
         _LOGGER.exception("Worker startup failed.")
         return 1

@@ -236,7 +236,7 @@ def _sleep_interruptible(seconds):
                     sanitize_telegram_error(exc),
                 )
             last_heartbeat = now
-        time.sleep(min(1.0, deadline - time.monotonic()))
+        time.sleep(max(0.0, min(1.0, deadline - time.monotonic())))
 
 
 # ---------------------------------------------------------------------------

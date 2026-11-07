@@ -86,7 +86,16 @@ class Phase7FailureConcurrencyTests(unittest.TestCase):
             )
             self.database._set_state(conn, "publish_cycle_id", 1)
             self.database._set_state(conn, "cycle_post_number", 0)
-            self.database._set_state(conn, "go_live_cutoff", 0)
+            self.database._set_state(
+                conn,
+                "go_live_bootstrap_status",
+                self.database.GO_LIVE_READY,
+            )
+            self.database._set_state(
+                conn,
+                "go_live_first_update_id",
+                0,
+            )
             self.database._commit(conn)
 
     def _insert_post(

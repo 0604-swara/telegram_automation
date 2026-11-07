@@ -93,10 +93,12 @@ destination channel. Eligible content includes text posts, single photos
 (including captions), and photo albums; album members are stored together.
 
 Existing channel history is not imported. The Bot API does not provide a
-method to enumerate arbitrary historical channel posts. Pending channel
-updates created before the persisted go-live cutoff are ignored, and existing
-database rows are retained but marked ineligible. Starting or restarting the
-worker will not make old rows eligible. No backfill is planned.
+method to enumerate arbitrary historical channel posts. Existing database
+rows are retained but marked ineligible. Before the listener starts, the
+worker establishes a one-time update-ID boundary; pending updates at or below
+that boundary are excluded. Updates with higher IDs, including posts whose
+message timestamp matches the initialization second, remain eligible. No
+backfill is planned.
 
 The scheduler checks its first slot at startup and then runs at most one
 publishing attempt per configured 300-second slot. If a slot has no eligible
@@ -108,10 +110,10 @@ continues after all eligible posts have been published.
 Do not upload `telegram_test.db`, local development DBs, or test backups to
 the Render disk. Before starting the worker, the operator must confirm the
 production disk is intentionally empty or contains the approved production
-database. The v5 startup migration retains pre-existing rows and publish
-history but marks every existing queue row ineligible. Take and verify an
-approved backup before that migration if the database contains records that
-must be preserved.
+database. Schema migration to v6 retains pre-existing rows and publish
+history, marks existing queue rows ineligible, and leaves go-live bootstrap
+pending. Take and verify an approved backup before that migration if the
+database contains records that must be preserved.
 
 After the persistent disk contains the approved DB (or is intentionally
 empty), the launcher:
@@ -121,13 +123,42 @@ empty), the launcher:
 3. Acquires the process-manager lock.
 4. Rejects unrelated, unversioned, malformed, or unsupported SQLite schemas
    before changing journal mode or applying migrations. A genuinely empty
-   database is initialized; supported version 3 or 4 schemas are migrated
-   transactionally to version 5, and version 5 is verified before either
-   child starts.
-5. Starts exactly one listener and scheduler with the identical DB path.
+   database is initialized; supported version 3, 4, or 5 schemas are migrated
+   transactionally to version 6, and version 6 is verified before bootstrap.
+5. Persists bootstrap state as `capturing`, then makes exactly one bounded
+   `getUpdates` request with offset `-1` and timeout `0`. Telegram returns at
+   most the newest pending update and forgets earlier pending updates. Its
+   update ID defines the exclusive boundary. If the queue is empty, the first
+   update received after that response is eligible; an empty response is not
+   treated as a permanent claim that no update can arrive afterward.
+6. Persists the boundary and next polling offset in one SQLite transaction,
+   then starts exactly one listener and scheduler with the identical DB path.
 
-Schema version 4 introduced persistent `publish_history`; version 5 adds the
-new-post eligibility cutoff. Earlier successful publishes cannot be
+The boundary is the server-side point when Telegram handles the single
+bootstrap request, not the earlier beginning of database initialization.
+Updates arriving after that point remain pending for the listener, even while
+the child process is starting. The listener inserts an eligible post and
+advances the update offset in the same SQLite transaction. If that
+transaction fails, neither change is committed and Telegram may redeliver the
+update; the unique source-channel/message key prevents duplicate queue rows.
+This is not an exactly-once guarantee across Telegram and SQLite.
+
+Bootstrap is never repeated after its state is `ready`; restarts resume from
+the persisted offset. A crash or network failure after bootstrap enters
+`capturing` is ambiguous and blocks startup. A confirmed HTTP 409 webhook
+conflict is persisted separately and also blocks startup. Do not clear these
+states or restart the worker blindly. An operator must resolve the webhook or
+inspect the pending-update boundary and explicitly recover with
+`database.recover_go_live_bootstrap(boundary_update_id, operator_confirmed=True)`.
+For an empty reviewed boundary, pass `None`. Selecting a recovery boundary
+can intentionally exclude updates up to that ID; the Bot API and SQLite do
+not share a transaction and cannot provide a strict no-loss/exactly-once
+bootstrap guarantee. Never choose a boundary without reviewing which pending
+posts should be included.
+
+Schema version 4 introduced persistent `publish_history`; version 5 added
+new-post eligibility; version 6 replaces the timestamp cutoff with a
+persisted update-ID bootstrap boundary. Earlier successful publishes cannot be
 reconstructed, but new successful publish units are appended transactionally
 across cycles. Verify the approved DB state and intended channels before
 allowing this worker to start.
@@ -151,7 +182,7 @@ review the Git change set. During eventual Render setup:
    the worker, listener, and scheduler without revealing credentials.
 5. Verify the listener and scheduler report the same `/var/data/telegram_queue.db`
    path, both locks are acquired, and heartbeats become current.
-6. Confirm `PRAGMA journal_mode` is `wal`, schema version is 5, integrity is
+6. Confirm `PRAGMA journal_mode` is `wal`, schema version is 6, integrity is
    `ok`, `publish_history` exists, and all pre-existing rows have
    `live_eligible=0`.
 

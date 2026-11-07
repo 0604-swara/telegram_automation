@@ -16,8 +16,12 @@ from config import ConfigurationError, validate_config
 from database import (
     get_offset,
     initialize_database,
+    begin_go_live_bootstrap,
+    complete_go_live_bootstrap,
+    mark_go_live_webhook_conflict,
     process_telegram_update,
     record_heartbeat,
+    require_go_live_ready,
 )
 
 load_dotenv()
@@ -235,7 +239,7 @@ def _extract_retry_after(response, fallback=MIN_RETRY_SECONDS):
         return fallback
 
 
-def fetch_updates(offset, session):
+def fetch_updates(offset, session, poll_timeout=POLL_TIMEOUT_SECONDS):
     """
     Long-poll Telegram getUpdates.
 
@@ -244,7 +248,7 @@ def fetch_updates(offset, session):
     Raises RuntimeError for Telegram API / rate-limit errors after logging.
     """
     params = {
-        "timeout": POLL_TIMEOUT_SECONDS,
+        "timeout": poll_timeout,
         "allowed_updates": json.dumps(["channel_post"]),
     }
     if offset is not None:
@@ -256,6 +260,10 @@ def fetch_updates(offset, session):
         timeout=HTTP_TIMEOUT_SECONDS,
     )
 
+    if response.status_code == 409:
+        raise WebhookConflictError(
+            "Telegram getUpdates is unavailable while a webhook is configured."
+        )
     if response.status_code == 429:
         retry_after = _extract_retry_after(response)
         raise TelegramRateLimitError(retry_after, response.text)
@@ -278,6 +286,67 @@ def fetch_updates(offset, session):
         )
 
     return payload
+
+
+class WebhookConflictError(RuntimeError):
+    """Raised when getUpdates conflicts with an active Telegram webhook."""
+
+
+class GoLiveBootstrapError(RuntimeError):
+    """Raised when the persisted go-live update boundary cannot be established."""
+
+
+def bootstrap_go_live_boundary(session=None):
+    """
+    Establish one bounded update-id boundary before starting the listener.
+
+    A negative offset of -1 asks Telegram for only the newest pending update
+    and discards older pending updates. This is one request, never a drain
+    loop. Updates arriving after Telegram evaluates the request remain beyond
+    the returned boundary and are processed normally.
+    """
+    state = begin_go_live_bootstrap()
+    if state["status"] == "ready":
+        return state["first_update_id"]
+
+    owns_session = session is None
+    session = session or requests.Session()
+    try:
+        try:
+            payload = fetch_updates(-1, session, poll_timeout=0)
+        except WebhookConflictError:
+            mark_go_live_webhook_conflict()
+            raise GoLiveBootstrapError(
+                "Go-live bootstrap blocked by a configured Telegram webhook; "
+                "remove the webhook and perform explicit operator recovery."
+            ) from None
+        except Exception:
+            raise GoLiveBootstrapError(
+                "Go-live boundary request failed after bootstrap began; "
+                "database state is ambiguous and requires manual recovery."
+            ) from None
+
+        updates = payload.get("result")
+        if not isinstance(updates, list):
+            raise GoLiveBootstrapError(
+                "Go-live boundary response has an invalid updates list; "
+                "database state requires manual recovery."
+            )
+        try:
+            boundary_id = max(
+                (int(update["update_id"]) for update in updates),
+                default=None,
+            )
+        except (KeyError, TypeError, ValueError):
+            raise GoLiveBootstrapError(
+                "Go-live boundary response has an invalid update ID; "
+                "database state requires manual recovery."
+            ) from None
+
+        return complete_go_live_bootstrap(boundary_id)
+    finally:
+        if owns_session:
+            session.close()
 
 
 class TelegramRateLimitError(RuntimeError):
@@ -395,6 +464,7 @@ def listen_to_channel():
     _shutdown_requested = False
     install_signal_handlers()
 
+    require_go_live_ready()
     offset = get_offset()
     retry_delay = MIN_RETRY_SECONDS
 
@@ -465,6 +535,7 @@ def main():
     validate_environment()
     with single_listener_lock(LOCK_FILE):
         initialize_database()
+        require_go_live_ready()
         listen_to_channel()
     return 0 if not _shutdown_requested else 0
 

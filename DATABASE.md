@@ -48,7 +48,7 @@ decision.**
 | `claim_owner` | TEXT | **Phase 3** scheduler instance id |
 | `destination_message_ids` | TEXT | **Phase 3** JSON list of destination message ids |
 | `cycle_id` | INTEGER | **Phase 3** publish cycle that last claimed/published |
-| `live_eligible` | INTEGER | `1` only for posts received after the persisted go-live cutoff |
+| `live_eligible` | INTEGER | `1` only for posts received after the persisted update-ID boundary |
 
 **Unique constraint:** `(channel_id, message_id)` — prevents duplicate ingest.
 
@@ -83,8 +83,10 @@ Key/value operational state. Important keys:
 | `update_offset` | Telegram `getUpdates` offset (must be preserved) |
 | `cycle_post_number` | In-cycle Post # sequence |
 | `publish_cycle_id` | Monotonic publishing cycle counter |
-| `schema_version` | Current schema version (`5`) |
-| `go_live_cutoff` | Unix timestamp captured once at first application initialization |
+| `schema_version` | Current schema version (`6`) |
+| `go_live_bootstrap_status` | `pending`, `capturing`, `webhook_conflict`, or `ready` |
+| `go_live_first_update_id` | Exclusive first-eligible update ID; empty means no pending update was observed |
+| `update_offset` | Next Telegram `getUpdates` offset, persisted transactionally |
 | `schema_migrated_at` | UTC timestamp of last migration |
 | `last_cycle_restart_at` | UTC timestamp of last cycle restart |
 
@@ -116,18 +118,37 @@ history starts with successful publishes after this migration.
 
 The version 5 migration adds `live_eligible`. Existing queue records are
 preserved but marked ineligible, so pending or previously published history
-cannot enter a new publishing cycle. New records received after go-live are
-eligible. `go_live_cutoff` is stored once and remains stable across restarts.
-Channel updates whose Telegram message date is at or before that cutoff are
-ignored while their update offset is still advanced. Telegram message dates
-have one-second resolution, so a post in the same timestamp second as the
-cutoff is conservatively excluded.
+cannot enter a new publishing cycle.
+
+## Schema version 6: update-ID go-live boundary
+
+Before the listener starts, the worker persists `capturing`, makes one
+bounded `getUpdates` request with offset `-1`, and stores the first eligible
+update ID and listener offset. A negative offset returns at most the newest
+pending update and discards older pending updates; this handles queues larger
+than Telegram's normal 100-update response limit without an unbounded drain.
+If the response is empty, the first update arriving after that response is
+eligible. Message timestamps do not determine eligibility.
+
+The listener only processes updates after bootstrap becomes `ready`. Each
+eligible post insert and its next offset are committed in the same SQLite
+transaction. Duplicate delivery is guarded by the unique channel/message key.
+Restarts resume the persisted offset and never recapture a ready boundary.
+
+Telegram and SQLite cannot share a transaction. A crash or network failure
+while state is `capturing` is ambiguous and blocks startup; HTTP 409 webhook
+conflicts are persisted separately and also block startup. After operator
+review, recovery requires an explicit call to
+`recover_go_live_bootstrap(boundary_update_id, operator_confirmed=True)`.
+Passing `None` is only appropriate after an operator confirms an empty
+boundary. The Bot API cannot guarantee exactly-once or strict no-loss
+processing across this external boundary.
 
 ### Startup schema preflight
 
 Startup permits a genuinely empty database, migrates the recognized version 3
-application schema through version 5, migrates supported versions 3 or 4,
-and accepts an already-current version 5 schema. It rejects unversioned,
+application schema through version 6, migrates supported versions 3, 4, or 5,
+and accepts an already-current version 6 schema. It rejects unversioned,
 malformed, unrelated, or unsupported schemas before enabling WAL or applying
 migrations. A rejected database is not silently treated as empty and must be
 inspected and backed up before any operator-approved conversion.
@@ -263,10 +284,10 @@ running database or reuse stale WAL/SHM sidecars.
 
 ## Apply / re-apply migration
 
-Safe to run repeatedly. On a database without a `go_live_cutoff`, this command
-establishes the new-post-only boundary and marks existing rows ineligible.
-For production, run it only when the approved go-live is beginning; the
-normal launcher performs initialization automatically.
+Schema initialization is safe to run repeatedly and marks existing rows
+ineligible during migration. The separate update-ID boundary is captured by
+the process manager immediately before starting the listener; running
+`database.py` alone does not complete go-live.
 
 ```bash
 python database.py
@@ -280,11 +301,13 @@ After migration, confirm:
 2. `PRAGMA journal_mode` → `wal`
 3. Phase 3 columns exist
 4. Required queue and publish-history indexes exist
-5. `bot_state.update_offset` unchanged from pre-migration value
-6. All existing `incoming_posts` rows still present
-7. `schema_version` = `5`
-8. `publish_history` table exists and is preserved by backup/restore
-9. Pre-go-live queue rows have `live_eligible=0`
+5. Existing offsets and records remain intact through schema migration; the
+   explicit go-live bootstrap replaces the listener offset with the boundary
+6. `bot_state.go_live_bootstrap_status` is `ready` after successful bootstrap
+7. All existing `incoming_posts` rows still present
+8. `schema_version` = `6`
+9. `publish_history` table exists and is preserved by backup/restore
+10. Pre-go-live queue rows have `live_eligible=0`
 
 `verify_schema()` performs these checks programmatically.
 
@@ -292,7 +315,7 @@ After migration, confirm:
 
 The migration preserves rows, but rollback to an older scheduler is not safe:
 older versions do not enforce `live_eligible` and could publish retained
-historical rows. Use only a version that enforces the schema 5 new-post-only
+historical rows. Use only a version that enforces the schema 6 new-post-only
 policy after migration.
 
 ## Uncertain publish reconciliation

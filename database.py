@@ -21,7 +21,11 @@ except ConfigurationError as exc:
 DEFAULT_STALE_CLAIM_SECONDS = int(os.getenv("STALE_CLAIM_SECONDS", "900"))
 
 # Schema version stored in bot_state after successful migration.
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
+GO_LIVE_PENDING = "pending"
+GO_LIVE_CAPTURING = "capturing"
+GO_LIVE_WEBHOOK_CONFLICT = "webhook_conflict"
+GO_LIVE_READY = "ready"
 
 # Additive claim and publish-evidence columns.
 PHASE3_COLUMNS = {
@@ -180,10 +184,10 @@ def _preflight_schema(conn):
         )
 
     version = _get_state(conn, "schema_version")
-    if version not in {"3", "4", SCHEMA_VERSION}:
+    if version not in {"3", "4", "5", SCHEMA_VERSION}:
         raise DatabaseError(
             "Existing database schema version is unsupported "
-            f"({version or 'unversioned'}); expected version 3, 4, or "
+            f"({version or 'unversioned'}); expected version 3, 4, 5, or "
             f"{SCHEMA_VERSION}. No migration was applied."
         )
 
@@ -208,25 +212,43 @@ def _preflight_schema(conn):
         )
 
     has_history = "publish_history" in tables
-    if (version in {"4", SCHEMA_VERSION}) != has_history:
+    if (version in {"4", "5", SCHEMA_VERSION}) != has_history:
         raise DatabaseError(
             "Existing database schema version does not match its tables; "
             "no migration was applied."
         )
-    if version == SCHEMA_VERSION:
+    if version in {"5", SCHEMA_VERSION}:
         if "live_eligible" not in post_columns:
             raise DatabaseError(
                 "Existing database is missing live-post eligibility; "
                 "no migration was applied."
             )
-        cutoff = _get_state(conn, "go_live_cutoff")
-        try:
-            int(cutoff)
-        except (TypeError, ValueError) as exc:
+    if version == SCHEMA_VERSION:
+        bootstrap_status = _get_state(conn, "go_live_bootstrap_status")
+        first_update_id = _get_state(conn, "go_live_first_update_id")
+        if bootstrap_status not in {
+            GO_LIVE_PENDING,
+            GO_LIVE_CAPTURING,
+            GO_LIVE_WEBHOOK_CONFLICT,
+            GO_LIVE_READY,
+        }:
             raise DatabaseError(
-                "Existing database has an invalid go-live cutoff; "
+                "Existing database has an invalid go-live bootstrap state; "
                 "no migration was applied."
-            ) from exc
+            )
+        if first_update_id is not None and first_update_id != "":
+            try:
+                int(first_update_id)
+            except (TypeError, ValueError) as exc:
+                raise DatabaseError(
+                    "Existing database has an invalid go-live update "
+                    "boundary; no migration was applied."
+                ) from exc
+        if bootstrap_status == GO_LIVE_READY and first_update_id is None:
+            raise DatabaseError(
+                "Existing database is missing its go-live update boundary; "
+                "no migration was applied."
+            )
     if has_history and not {
         "id",
         "cycle_id",
@@ -497,8 +519,16 @@ def _migrate_schema_on_connection(conn):
             conn.execute(
                 "UPDATE incoming_posts SET live_eligible = 0"
             )
-        if _get_state(conn, "go_live_cutoff") is None:
-            _set_state(conn, "go_live_cutoff", int(time.time()))
+        if previous_version != SCHEMA_VERSION:
+            conn.execute(
+                "DELETE FROM bot_state WHERE key IN "
+                "('go_live_update_id', 'go_live_first_update_id')"
+            )
+            _set_state(conn, "go_live_bootstrap_status", GO_LIVE_PENDING)
+        elif _get_state(conn, "go_live_bootstrap_status") is None:
+            _set_state(conn, "go_live_bootstrap_status", GO_LIVE_PENDING)
+        if _get_state(conn, "go_live_first_update_id") is None:
+            _set_state(conn, "go_live_first_update_id", "")
 
         conn.execute(
             """
@@ -715,36 +745,11 @@ def _insert_incoming_post(conn, message):
 
 
 def save_post(message):
-    """Save an incoming Telegram channel post."""
-    with get_connection() as conn:
-        _begin_immediate(conn)
-        try:
-            cutoff = int(_get_state(conn, "go_live_cutoff"))
-            if not _is_post_after_cutoff(message, cutoff):
-                _commit(conn)
-                return False
-            inserted, message_type = _insert_incoming_post(conn, message)
-            _commit(conn)
-        except Exception:
-            _safe_rollback(conn)
-            raise
-
-    if inserted:
-        logging.info(
-            "Received Telegram message ID %s (type=%s)",
-            message["message_id"],
-            message_type,
-        )
-
-    return inserted
-
-
-def _is_post_after_cutoff(message, cutoff):
-    """Use Telegram's second-resolution date to reject pre-go-live posts."""
-    try:
-        return int(message.get("date")) > int(cutoff)
-    except (AttributeError, TypeError, ValueError):
-        return False
+    """Reject inserts that bypass the update-id and offset transaction."""
+    raise DatabaseError(
+        "save_post() is unsafe for listener ingestion; use "
+        "process_telegram_update() with the Telegram update_id."
+    )
 
 
 def get_offset():
@@ -752,6 +757,155 @@ def get_offset():
     with get_connection() as conn:
         value = _get_state(conn, "update_offset")
     return int(value) if value is not None else None
+
+
+def get_go_live_state(conn=None):
+    """Return persisted bootstrap status and exclusive first eligible ID."""
+    def read_state(connection):
+        status = _get_state(connection, "go_live_bootstrap_status")
+        first_update_id = _get_state(
+            connection,
+            "go_live_first_update_id",
+        )
+        if first_update_id == "":
+            first_update_id = None
+        elif first_update_id is not None:
+            first_update_id = int(first_update_id)
+        return {
+            "status": status,
+            "first_update_id": first_update_id,
+        }
+
+    if conn is not None:
+        return read_state(conn)
+    with get_connection() as connection:
+        return read_state(connection)
+
+
+def begin_go_live_bootstrap():
+    """Persist intent before the external boundary request; never auto-reset."""
+    with get_connection() as conn:
+        _begin_immediate(conn)
+        try:
+            status = _get_state(conn, "go_live_bootstrap_status")
+            first_update_id = _get_state(conn, "go_live_first_update_id")
+            if status == GO_LIVE_READY:
+                _commit(conn)
+                return {
+                    "status": status,
+                    "first_update_id": (
+                        int(first_update_id)
+                        if first_update_id not in (None, "")
+                        else None
+                    ),
+                }
+            if status != GO_LIVE_PENDING:
+                raise DatabaseError(
+                    "Go-live bootstrap is ambiguous or blocked "
+                    f"(state={status or 'missing'}); manual recovery is "
+                    "required."
+                )
+            _set_state(conn, "go_live_bootstrap_status", GO_LIVE_CAPTURING)
+            _commit(conn)
+            return {"status": GO_LIVE_CAPTURING, "first_update_id": None}
+        except Exception:
+            _safe_rollback(conn)
+            raise
+
+
+def complete_go_live_bootstrap(boundary_update_id):
+    """Persist the first eligible update ID and listener cursor atomically."""
+    first_update_id = (
+        None if boundary_update_id is None else int(boundary_update_id) + 1
+    )
+    with get_connection() as conn:
+        _begin_immediate(conn)
+        try:
+            status = _get_state(conn, "go_live_bootstrap_status")
+            if status != GO_LIVE_CAPTURING:
+                raise DatabaseError(
+                    "Go-live bootstrap completion requires an active "
+                    "capture state."
+                )
+            _set_state(
+                conn,
+                "go_live_first_update_id",
+                "" if first_update_id is None else first_update_id,
+            )
+            conn.execute(
+                "DELETE FROM bot_state WHERE key = 'update_offset'"
+            )
+            if first_update_id is not None:
+                _set_state(conn, "update_offset", first_update_id)
+            _set_state(conn, "go_live_bootstrap_status", GO_LIVE_READY)
+            _commit(conn)
+        except Exception:
+            _safe_rollback(conn)
+            raise
+    return first_update_id
+
+
+def mark_go_live_webhook_conflict():
+    """Persist a confirmed Telegram webhook conflict; operator action needed."""
+    with get_connection() as conn:
+        _begin_immediate(conn)
+        try:
+            if _get_state(conn, "go_live_bootstrap_status") != GO_LIVE_CAPTURING:
+                raise DatabaseError("No active go-live bootstrap to block.")
+            _set_state(
+                conn,
+                "go_live_bootstrap_status",
+                GO_LIVE_WEBHOOK_CONFLICT,
+            )
+            _commit(conn)
+        except Exception:
+            _safe_rollback(conn)
+            raise
+
+
+def recover_go_live_bootstrap(boundary_update_id, operator_confirmed=False):
+    """Manually finalize an ambiguous bootstrap using an operator-reviewed ID."""
+    if operator_confirmed is not True:
+        raise DatabaseError(
+            "Manual go-live recovery requires explicit operator confirmation."
+        )
+    first_update_id = (
+        None if boundary_update_id is None else int(boundary_update_id) + 1
+    )
+    with get_connection() as conn:
+        _begin_immediate(conn)
+        try:
+            status = _get_state(conn, "go_live_bootstrap_status")
+            if status not in {GO_LIVE_CAPTURING, GO_LIVE_WEBHOOK_CONFLICT}:
+                raise DatabaseError(
+                    "Manual go-live recovery is only valid for an ambiguous "
+                    "or webhook-blocked bootstrap."
+                )
+            _set_state(
+                conn,
+                "go_live_first_update_id",
+                "" if first_update_id is None else first_update_id,
+            )
+            conn.execute(
+                "DELETE FROM bot_state WHERE key = 'update_offset'"
+            )
+            if first_update_id is not None:
+                _set_state(conn, "update_offset", first_update_id)
+            _set_state(conn, "go_live_bootstrap_status", GO_LIVE_READY)
+            _commit(conn)
+        except Exception:
+            _safe_rollback(conn)
+            raise
+    return first_update_id
+
+
+def require_go_live_ready():
+    state = get_go_live_state()
+    if state["status"] != GO_LIVE_READY:
+        raise DatabaseError(
+            "Go-live update boundary is not initialized; refusing to poll."
+        )
+    return state
 
 
 def save_offset(offset):
@@ -784,6 +938,7 @@ def process_telegram_update(update, source_channel_id):
         raise DatabaseError("Telegram update is missing update_id")
 
     next_offset = int(update["update_id"]) + 1
+    update_id = int(update["update_id"])
     channel_post = update.get("channel_post")
 
     result = {
@@ -801,31 +956,55 @@ def process_telegram_update(update, source_channel_id):
     with get_connection() as conn:
         _begin_immediate(conn)
         try:
+            bootstrap_status = _get_state(
+                conn,
+                "go_live_bootstrap_status",
+            )
+            if bootstrap_status != GO_LIVE_READY:
+                raise DatabaseError(
+                    "Go-live update boundary is not ready; refusing to "
+                    "process or acknowledge Telegram updates."
+                )
+            first_update_id_value = _get_state(
+                conn,
+                "go_live_first_update_id",
+            )
+            first_update_id = (
+                None
+                if first_update_id_value in (None, "")
+                else int(first_update_id_value)
+            )
+            pre_go_live = (
+                first_update_id is not None
+                and update_id < first_update_id
+            )
+
             if channel_post is not None:
                 chat = channel_post.get("chat") or {}
                 chat_id = chat.get("id")
                 result["channel_id"] = chat_id
 
-                if str(chat_id) == str(source_channel_id):
+                if str(chat_id) == str(source_channel_id) and not pre_go_live:
                     result["message_id"] = channel_post.get("message_id")
                     result["media_group_id"] = channel_post.get(
                         "media_group_id"
                     )
 
-                    cutoff = int(_get_state(conn, "go_live_cutoff"))
-                    if _is_post_after_cutoff(channel_post, cutoff):
-                        result["ignored"] = False
-                        inserted, message_type = _insert_incoming_post(
-                            conn,
-                            channel_post,
-                        )
-                        result["message_type"] = message_type
-                        result["inserted"] = inserted
-                        result["duplicate"] = not inserted
-                    else:
-                        result["pre_live_ignored"] = True
+                    result["ignored"] = False
+                    inserted, message_type = _insert_incoming_post(
+                        conn,
+                        channel_post,
+                    )
+                    result["message_type"] = message_type
+                    result["inserted"] = inserted
+                    result["duplicate"] = not inserted
+            if pre_go_live:
+                result["pre_live_ignored"] = True
+                result["ignored"] = True
 
-            _set_state(conn, "update_offset", next_offset)
+            current_offset = _get_state(conn, "update_offset")
+            if current_offset is None or next_offset > int(current_offset):
+                _set_state(conn, "update_offset", next_offset)
             _commit(conn)
         except Exception:
             _safe_rollback(conn)
@@ -1872,14 +2051,15 @@ def get_health_report(stale_heartbeat_seconds=600):
             else:
                 post_columns = _column_names(conn, "incoming_posts")
                 schema_version = _get_state(conn, "schema_version")
-                cutoff = _get_state(conn, "go_live_cutoff")
                 schema_ok = (
                     "live_eligible" in post_columns
                     and schema_version == SCHEMA_VERSION
-                    and cutoff is not None
                 )
                 if not schema_ok:
-                    error = "New-post-only schema version 5 is not available"
+                    error = (
+                        f"New-post-only schema version {SCHEMA_VERSION} "
+                        "is not available"
+                    )
                 else:
                     rows = conn.execute(
                         """
