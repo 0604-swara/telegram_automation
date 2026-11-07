@@ -33,6 +33,7 @@ POLL_TIMEOUT_SECONDS = 30
 HTTP_TIMEOUT_SECONDS = 35
 MIN_RETRY_SECONDS = 5
 MAX_RETRY_SECONDS = 60
+EMPTY_POLL_LOG_EVERY = 5
 LOCK_FILE = os.getenv("LISTENER_LOCK_FILE", "listener.lock")
 
 SUPPORTED_MESSAGE_TYPES = {
@@ -444,6 +445,30 @@ def _log_processed_update(result):
         )
 
 
+def _log_received_update(update):
+    update_type = next(
+        (
+            key
+            for key in (
+                "channel_post",
+                "edited_channel_post",
+                "message",
+                "edited_message",
+                "callback_query",
+                "my_chat_member",
+                "chat_member",
+            )
+            if key in update
+        ),
+        "unknown",
+    )
+    _logger.info(
+        "Telegram update received. update_id=%s update_type=%s",
+        update.get("update_id", "unknown"),
+        update_type,
+    )
+
+
 def process_updates(updates):
     """
     Persist each update through the atomic database helper.
@@ -452,6 +477,7 @@ def process_updates(updates):
     """
     latest_offset = None
     for update in updates:
+        _log_received_update(update)
         result = process_telegram_update(update, SOURCE_CHANNEL_ID)
         latest_offset = result["next_offset"]
         _log_processed_update(result)
@@ -467,6 +493,7 @@ def listen_to_channel():
     require_go_live_ready()
     offset = get_offset()
     retry_delay = MIN_RETRY_SECONDS
+    consecutive_empty_polls = 0
 
     _logger.info(
         "Source channel listener started. source_channel_id=%s offset=%s "
@@ -480,13 +507,34 @@ def listen_to_channel():
     try:
         while not _shutdown_requested:
             try:
+                poll_started_at = time.monotonic()
                 payload = fetch_updates(offset, session)
+                poll_duration = time.monotonic() - poll_started_at
                 updates = payload.get("result") or []
 
                 if updates:
+                    consecutive_empty_polls = 0
+                    _logger.info(
+                        "Telegram getUpdates poll succeeded. "
+                        "updates=%s duration_seconds=%.3f offset=%s",
+                        len(updates),
+                        poll_duration,
+                        offset,
+                    )
                     new_offset = process_updates(updates)
                     if new_offset is not None:
                         offset = new_offset
+                else:
+                    consecutive_empty_polls += 1
+                    if consecutive_empty_polls % EMPTY_POLL_LOG_EVERY == 0:
+                        _logger.info(
+                            "Telegram getUpdates poll succeeded. updates=0 "
+                            "consecutive_empty_polls=%s "
+                            "duration_seconds=%.3f offset=%s",
+                            consecutive_empty_polls,
+                            poll_duration,
+                            offset,
+                        )
 
                 # Successful poll resets backoff and records liveness.
                 record_heartbeat("listener")

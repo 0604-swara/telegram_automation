@@ -548,6 +548,168 @@ class ListenerRegressionTests(unittest.TestCase):
         )
         self.assertEqual(request_params["offset"], 100)
 
+    def test_empty_poll_diagnostics_are_rate_limited(self):
+        poll_count = 0
+
+        def empty_poll(offset, session):
+            nonlocal poll_count
+            poll_count += 1
+            if poll_count == 10:
+                self.handler._shutdown_requested = True
+            return {"result": []}
+
+        self.handler._shutdown_requested = False
+        with (
+            self.assertLogs(self.handler._logger, level="INFO") as logs,
+            patch.object(self.handler, "install_signal_handlers"),
+            patch.object(self.handler, "get_offset", return_value=123),
+            patch.object(self.handler, "fetch_updates", side_effect=empty_poll),
+            patch.object(
+                self.handler.requests,
+                "Session",
+                return_value=MagicMock(),
+            ),
+            patch.object(self.handler, "record_heartbeat"),
+        ):
+            self.handler.listen_to_channel()
+
+        diagnostics = [
+            line
+            for line in logs.output
+            if "poll succeeded. updates=0" in line
+        ]
+        self.assertEqual(len(diagnostics), 2)
+        self.assertIn("consecutive_empty_polls=5", diagnostics[0])
+        self.assertIn("consecutive_empty_polls=10", diagnostics[1])
+        self.assertTrue(
+            all(
+                "updates=0" in line
+                and "duration_seconds=" in line
+                and "offset=123" in line
+                for line in diagnostics
+            )
+        )
+
+    def test_channel_post_logs_update_id_without_message_content(self):
+        message_content = "Do not include this private post text in logs"
+
+        def one_channel_post(offset, session):
+            self.handler._shutdown_requested = True
+            return {
+                "result": [
+                    {
+                        "update_id": 1201,
+                        "channel_post": {
+                            "message_id": 981,
+                            "chat": {"id": -100111},
+                            "date": 1,
+                            "text": message_content,
+                        },
+                    }
+                ]
+            }
+
+        self.handler._shutdown_requested = False
+        with (
+            self.assertLogs(self.handler._logger, level="INFO") as logs,
+            patch.object(self.handler, "install_signal_handlers"),
+            patch.object(self.handler, "get_offset", return_value=1200),
+            patch.object(
+                self.handler,
+                "fetch_updates",
+                side_effect=one_channel_post,
+            ),
+            patch.object(
+                self.handler.requests,
+                "Session",
+                return_value=MagicMock(),
+            ),
+            patch.object(self.handler, "record_heartbeat"),
+        ):
+            self.handler.listen_to_channel()
+
+        output = "\n".join(logs.output)
+        self.assertIn("updates=1", output)
+        self.assertIn("duration_seconds=", output)
+        self.assertIn("offset=1200", output)
+        self.assertIn("update_id=1201 update_type=channel_post", output)
+        self.assertNotIn(message_content, output)
+
+    def test_polling_api_errors_remain_logged(self):
+        def fail_poll(offset, session):
+            raise RuntimeError("Telegram API error (HTTP 400): test failure")
+
+        self.handler._shutdown_requested = False
+
+        def stop_after_backoff(_seconds):
+            self.handler._shutdown_requested = True
+
+        with (
+            self.assertLogs(self.handler._logger, level="ERROR") as logs,
+            patch.object(self.handler, "install_signal_handlers"),
+            patch.object(self.handler, "get_offset", return_value=1200),
+            patch.object(self.handler, "fetch_updates", side_effect=fail_poll),
+            patch.object(
+                self.handler.requests,
+                "Session",
+                return_value=MagicMock(),
+            ),
+            patch.object(
+                self.handler,
+                "_sleep_interruptible",
+                side_effect=stop_after_backoff,
+            ),
+        ):
+            self.handler.listen_to_channel()
+
+        self.assertTrue(
+            any("Listener error:" in line for line in logs.output)
+        )
+        self.assertTrue(
+            any("HTTP 400" in line for line in logs.output)
+        )
+
+    def test_webhook_conflict_during_polling_remains_logged(self):
+        session = MagicMock()
+        session.get.return_value.status_code = 409
+        real_fetch_updates = self.handler.fetch_updates
+        self.handler._shutdown_requested = False
+
+        def conflict_poll(offset, _session):
+            return real_fetch_updates(offset, session)
+
+        def stop_after_backoff(_seconds):
+            self.handler._shutdown_requested = True
+
+        with (
+            self.assertLogs(self.handler._logger, level="ERROR") as logs,
+            patch.object(self.handler, "install_signal_handlers"),
+            patch.object(self.handler, "get_offset", return_value=1200),
+            patch.object(
+                self.handler,
+                "fetch_updates",
+                side_effect=conflict_poll,
+            ),
+            patch.object(
+                self.handler.requests,
+                "Session",
+                return_value=MagicMock(),
+            ),
+            patch.object(
+                self.handler,
+                "_sleep_interruptible",
+                side_effect=stop_after_backoff,
+            ),
+        ):
+            self.handler.listen_to_channel()
+
+        self.assertTrue(
+            any("WebhookConflictError" in line for line in logs.output)
+        )
+        combined_logs = "\n".join(logs.output)
+        self.assertNotIn("000000:LISTENER_TEST_TOKEN", combined_logs)
+        self.assertNotIn("api.telegram.org", combined_logs)
+
     def test_album_is_published_as_one_group_not_individual_posts(self):
         self._ingest_album()
 
